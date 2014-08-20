@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNet.SignalR.Client.Http;
 using Microsoft.AspNet.SignalR.Client.Infrastructure;
 using Microsoft.AspNet.SignalR.Client.Transports.WebSockets;
+using Newtonsoft.Json.Linq;
 
 namespace Microsoft.AspNet.SignalR.Client.Transports
 {
@@ -14,7 +15,8 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
     {
         private readonly ClientWebSocketHandler _webSocketHandler;
         private CancellationToken _disconnectToken;
-        private TransportInitializationHandler _initializeHandler;
+        //private TransportInitializationHandler _initializeHandler;
+        private TaskCompletionSource<object> _initTcs;
         private IConnection _connection;
         private string _connectionData;
         private CancellationTokenSource _webSocketTokenSource;
@@ -61,39 +63,68 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
                 throw new ArgumentNullException("connection");
             }
 
-            _initializeHandler = new TransportInitializationHandler(HttpClient, connection, connectionData, Name, disconnectToken, TransportHelper);
+//            _initializeHandler = new TransportInitializationHandler(HttpClient, connection, connectionData, Name, disconnectToken, TransportHelper);
 
             // Tie into the OnFailure event so that we can stop the transport silently.
-            _initializeHandler.OnFailure += () =>
-            {
-                Dispose();
-            };
+            //_initializeHandler.OnFailure += () =>
+            //{
+            //    Dispose();
+            //};
 
             _disconnectToken = disconnectToken;
             _connection = connection;
             _connectionData = connectionData;
 
-            // We don't need to await this task
-            PerformConnect().ContinueWith(task =>
-            {
-                if (task.IsFaulted)
-                {
-                    _initializeHandler.Fail(task.Exception);
-                }
-                else if (task.IsCanceled)
-                {
-                    _initializeHandler.Fail();
-                }
-            },
-            TaskContinuationOptions.NotOnRanToCompletion);
+            var startTransportTcs = new TaskCompletionSource<object>();
 
-            return _initializeHandler.Task;
+            _initTcs = new TaskCompletionSource<object>();
+            // We don't need to await this task
+            PerformConnect(_initTcs)
+                .Then(() => TransportHelper.GetStartResponse(HttpClient, _connection, _connectionData, Name)
+                    .Then(response =>
+                    {
+                        var started = _connection.JsonDeserializeObject<JObject>(response)["Response"];
+                        if (started.ToString() == "started")
+                        {
+                            startTransportTcs.TrySetResult(null);
+                        }
+                        else
+                        {
+                            startTransportTcs.TrySetException(new StartException(Resources.Error_StartFailed));
+                        }
+                    })).ContinueWith(task =>
+                    {
+                        if (task.IsFaulted)
+                        {
+                            startTransportTcs.TrySetUnwrappedException(task.Exception);
+                        }
+                        else if (task.IsCanceled)
+                        {
+                            startTransportTcs.TrySetException(new InvalidOperationException(Resources.Error_TransportFailedToConnect));
+                        }
+                    }, TaskContinuationOptions.NotOnRanToCompletion);
+
+            return startTransportTcs.Task;
         }
 
         // For testing
-        public virtual Task PerformConnect()
+        public virtual Task PerformConnect(TaskCompletionSource<object> connectTaskCompletionSource)
         {
-            return PerformConnect(UrlBuilder.BuildConnect(_connection, Name, _connectionData));
+            PerformConnect(UrlBuilder.BuildConnect(_connection, Name, _connectionData))
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        connectTaskCompletionSource.TrySetUnwrappedException(t.Exception);
+                    }
+                    else if (t.IsCanceled)
+                    {
+                        connectTaskCompletionSource.SetCanceled();
+                    }
+                }, 
+                TaskContinuationOptions.NotOnRanToCompletion);
+
+            return connectTaskCompletionSource.Task;
         }
 
         private async Task PerformConnect(string url)
@@ -139,7 +170,10 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
         {
             _connection.Trace(TraceLevels.Messages, "WS: OnMessage({0})", message);
 
-            TransportHelper.ProcessResponse(_connection, message, _initializeHandler.InitReceived);
+            TransportHelper.ProcessResponse(
+                _connection, 
+                message, 
+                () => _initTcs.TrySetResult(null));
         }
 
         // virtual for testing

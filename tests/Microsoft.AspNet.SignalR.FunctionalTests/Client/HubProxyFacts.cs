@@ -79,7 +79,9 @@ namespace Microsoft.AspNet.SignalR.Tests
                 IHubProxy proxy = hubConnection.CreateHubProxy("EchoHub");
 
                 var transport = new Mock<WebSocketTransport>() { CallBase = true };
-                transport.Setup(m => m.PerformConnect()).Returns(taskReturn());
+
+                var tcs = new TaskCompletionSource<object>();
+                transport.Setup(m => m.PerformConnect(tcs)).Returns(taskReturn());
 
                 using (hubConnection)
                 {

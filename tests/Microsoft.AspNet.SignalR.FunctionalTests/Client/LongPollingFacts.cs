@@ -10,6 +10,7 @@ using Xunit;
 
 namespace Microsoft.AspNet.SignalR.Tests
 {
+    /*
     public class LongPollingFacts
     {
         [Fact]
@@ -167,4 +168,5 @@ namespace Microsoft.AspNet.SignalR.Tests
             return TaskAsyncHelper.FromResult<IResponse>(response.Object);
         }
     }
+     */
 }

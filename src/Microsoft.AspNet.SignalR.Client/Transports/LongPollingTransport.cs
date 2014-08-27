@@ -17,7 +17,7 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
 
         private IConnection _connection;
         private string _connectionData;
-        private NegotiateInitializer _negotiateInitializer;
+        private TransportInitializationHandler _initializeHandler;
 
         private IRequest _currentRequest;
         private int _running;
@@ -75,16 +75,18 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
                                         CancellationToken disconnectToken,
                                         TransportInitializationHandler initializeHandler)
         {
+            if (initializeHandler == null)
+            {
+                throw new ArgumentNullException("initializeHandler");    
+            }
+
             _connection = connection;
             _connectionData = connectionData;
             _disconnectToken = disconnectToken;
-            _negotiateInitializer = new NegotiateInitializer(initializeHandler);
+            _initializeHandler = initializeHandler;
 
             // If the transport fails to initialize we want to silently stop
             initializeHandler.OnFailure += StopPolling;
-
-            // reconnectInvoker is created new on each poll
-            _reconnectInvoker = new ThreadSafeInvoker();
 
             _disconnectRegistration = disconnectToken.SafeRegister(state =>
             {
@@ -126,14 +128,9 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
 
                     if (task.IsFaulted || task.IsCanceled)
                     {
-                        if (task.IsCanceled)
-                        {
-                            exception = new OperationCanceledException(Resources.Error_TaskCancelledException);
-                        }
-                        else
-                        {
-                            exception = task.Exception.Unwrap();
-                        }
+                        exception = task.IsCanceled
+                            ? new OperationCanceledException(Resources.Error_TaskCancelledException)
+                            : task.Exception.Unwrap();
 
                         OnError(exception);
                     }
@@ -188,6 +185,9 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
         {
             if (Interlocked.Exchange(ref _running, 1) == 0)
             {
+                // reconnectInvoker is created new on each poll
+                _reconnectInvoker = new ThreadSafeInvoker();
+
                 Poll();
             }
         }
@@ -201,7 +201,20 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
             {
                 if (Interlocked.Exchange(ref _running, 0) == 1)
                 {
-                    Abort();
+                    // will be no-op if handler already finished (either succeeded or failed)
+                    _initializeHandler.Fail(new OperationCanceledException(Resources.Error_ConnectionCancelled, _disconnectToken));
+
+                    _disconnectRegistration.Dispose();
+
+                    // Complete any ongoing calls to Abort()
+                    // If someone calls Abort() later, have it no-op
+                    AbortHandler.CompleteAbort();
+
+                    if (_currentRequest != null)
+                    {
+                        // This will no-op if the request is already finished
+                        _currentRequest.Abort();
+                    }
                 }
             }
         }
@@ -210,7 +223,7 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
         {
             _connection.Trace(TraceLevels.Messages, "LP: OnMessage({0})", message);
 
-            var shouldReconnect = ProcessResponse(_connection, message, _negotiateInitializer.Complete);
+            var shouldReconnect = ProcessResponse(_connection, message, _initializeHandler.InitReceived);
 
             if (IsReconnecting(_connection))
             {
@@ -248,10 +261,9 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
         }
 
         private void OnError(Exception exception)
-
         {
-            // TODO: do not call once init complete?
-            _negotiateInitializer.Complete(exception);
+            // will be no-op if handler already finished (either succeeded or failed)
+            _initializeHandler.Fail(exception);
 
             _reconnectInvoker.Invoke();
 
@@ -271,36 +283,6 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
             }
         }
 
-        private void OnAbort()
-        {
-            _negotiateInitializer.Abort(_disconnectToken);
-            _disconnectRegistration.Dispose();
-
-            // Complete any ongoing calls to Abort()
-            // If someone calls Abort() later, have it no-op
-            AbortHandler.CompleteAbort();
-        }
-
-        /// <summary>
-        /// Aborts the currently active polling request, does not stop the Polling Request Handler.
-        /// </summary>
-        private void Abort()
-        {
-            OnAbort();
-
-            if (_currentRequest != null)
-            {
-                // This will no-op if the request is already finished
-                _currentRequest.Abort();
-            }
-        }
-
-        private static bool IsKeepAlive(ArraySegment<byte> readBuffer)
-        {
-            return readBuffer.Count == 1
-                && readBuffer.Array[readBuffer.Offset] == (byte)' ';
-        }
-
         private bool OnChunk(ArraySegment<byte> readBuffer)
         {
             if (IsKeepAlive(readBuffer))
@@ -312,9 +294,14 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
             return true;
         }
 
+        private static bool IsKeepAlive(ArraySegment<byte> readBuffer)
+        {
+            return readBuffer.Count == 1
+                && readBuffer.Array[readBuffer.Offset] == (byte)' ';
+        }
+
         /// <summary>
         /// Aborts the currently active polling request thereby forcing a reconnect.
-        /// This will not trigger OnAbort.
         /// </summary>
         public override void LostConnection(IConnection connection)
         {
@@ -329,7 +316,6 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
                 }
             }
         }
-
 
         private void TryDelayedReconnect(IConnection connection)
         {

@@ -15,10 +15,6 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
     {
         private NegotiationResponse _negotiationResponse;
 
-        private IConnection _connection;
-        private string _connectionData;
-        private TransportInitializationHandler _initializeHandler;
-
         private IRequest _currentRequest;
         private int _running;
         private readonly object _stopLock = new object();
@@ -80,25 +76,61 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
                 throw new ArgumentNullException("initializeHandler");    
             }
 
-            _connection = connection;
-            _connectionData = connectionData;
             _disconnectToken = disconnectToken;
-            _initializeHandler = initializeHandler;
 
             // If the transport fails to initialize we want to silently stop
             initializeHandler.OnFailure += StopPolling;
 
             _disconnectRegistration = disconnectToken.SafeRegister(state =>
             {
-                _reconnectInvoker.Invoke();
+                // will be no-op if handler already finished (either succeeded or failed)
+                initializeHandler.Fail(new OperationCanceledException(Resources.Error_ConnectionCancelled, _disconnectToken));
+
+                // _reconnectInvoker can be null if disconnectToken is tripped during start 
+                // (i.e. before the polling loop is started)
+                if (_reconnectInvoker != null)
+                {
+                    _reconnectInvoker.Invoke();
+                }
+
                 StopPolling();
             }, null);
 
-            StartPolling();
+            PerformConnect(connection, connectionData, initializeHandler)
+                .Then(() => StartPolling(connection, connectionData));
+        }
+
+        private Task PerformConnect(IConnection connection, string connectionData, TransportInitializationHandler initializationHandler)
+        {
+            var url = UrlBuilder.BuildConnect(connection, Name, connectionData);
+            connection.Trace(TraceLevels.Events, "LP Connect: {0}", url);
+
+            HttpClient.Initialize(connection);
+
+            return HttpClient
+                .Post(url,
+                    request =>
+                    {
+                        connection.PrepareRequest(request);
+                        initializationHandler.OnFailure += request.Abort;
+                    }, isLongRunning: false)
+                .Then(response => response.ReadAsString())
+                .Then(message => ProcessResponse(connection, message, initializationHandler.InitReceived))
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        initializationHandler.Fail();
+                    }
+                    else if (t.IsCanceled)
+                    {
+                        initializationHandler.Fail(new OperationCanceledException(Resources.Error_ConnectionCancelled));
+                    }
+                });
         }
 
         [SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes", Justification = "Exceptions are flowed back to user.")]
-        private void Poll()
+        private void Poll(IConnection connection, string connectionData)
         {
             // This is to ensure that we do not accidently fire off another poll after being told to stop
             lock (_stopLock)
@@ -110,16 +142,16 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
                 }
 
                 // A url is required
-                var url = ResolveUrl();
+                var url = ResolveUrl(connection, connectionData);
 
                 HttpClient.Post(url, request =>
                 {
-                    _connection.PrepareRequest(request);
+                    connection.PrepareRequest(request);
                     _currentRequest = request;
 
                     // This is called just prior to posting the request to ensure that any in-flight polling request
                     // is always executed before an OnAfterPoll
-                    TryDelayedReconnect(_connection);
+                    TryDelayedReconnect(connection);
                 }, isLongRunning: true)
                 .ContinueWith(task =>
                 {
@@ -132,63 +164,41 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
                             ? new OperationCanceledException(Resources.Error_TaskCancelledException)
                             : task.Exception.Unwrap();
 
-                        OnError(exception);
+                        OnError(connection, exception);
                     }
                     else
                     {
                         try
                         {
-                            next = task.Result.ReadAsString(OnChunk).Then(raw => OnMessage(raw));
+                            next = task.Result.ReadAsString(readBuffer => OnChunk(connection, readBuffer))
+                                .Then(raw => OnMessage(connection, raw));
                         }
                         catch (Exception ex)
                         {
                             exception = ex;
 
-                            OnError(exception);
+                            OnError(connection, exception);
                         }
                     }
 
                     next.Finally(
-                        state => OnAfterPoll((Exception) state).Then(() => Poll()),
+                        state => OnAfterPoll((Exception) state).Then(() => Poll(connection, connectionData)),
                         exception);
                 });
             }
         }
 
-        private string ResolveUrl()
-        {
-            string url;
-
-            if (_connection.MessageId == null)
-            {
-                url = UrlBuilder.BuildConnect(_connection, Name, _connectionData);
-                _connection.Trace(TraceLevels.Events, "LP Connect: {0}", url);
-            }
-            else if (IsReconnecting(_connection))
-            {
-                url = UrlBuilder.BuildReconnect(_connection, Name, _connectionData);
-                _connection.Trace(TraceLevels.Events, "LP Reconnect: {0}", url);
-            }
-            else
-            {
-                url = UrlBuilder.BuildPoll(_connection, Name, _connectionData);
-                _connection.Trace(TraceLevels.Events, "LP Poll: {0}", url);
-            }
-
-            return url;
-        }
-
         /// <summary>
         /// Starts the polling loop.
         /// </summary>
-        private void StartPolling()
+        internal void StartPolling(IConnection connection, string connectionData)
         {
             if (Interlocked.Exchange(ref _running, 1) == 0)
             {
                 // reconnectInvoker is created new on each poll
                 _reconnectInvoker = new ThreadSafeInvoker();
 
-                Poll();
+                Poll(connection, connectionData);
             }
         }
 
@@ -201,9 +211,6 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
             {
                 if (Interlocked.Exchange(ref _running, 0) == 1)
                 {
-                    // will be no-op if handler already finished (either succeeded or failed)
-                    _initializeHandler.Fail(new OperationCanceledException(Resources.Error_ConnectionCancelled, _disconnectToken));
-
                     _disconnectRegistration.Dispose();
 
                     // Complete any ongoing calls to Abort()
@@ -219,23 +226,41 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
             }
         }
 
-        private void OnMessage(string message)
+        private string ResolveUrl(IConnection connection, string connectionData)
         {
-            _connection.Trace(TraceLevels.Messages, "LP: OnMessage({0})", message);
+            string url;
 
-            var shouldReconnect = ProcessResponse(_connection, message, _initializeHandler.InitReceived);
+            if (IsReconnecting(connection))
+            {
+                url = UrlBuilder.BuildReconnect(connection, Name, connectionData);
+                connection.Trace(TraceLevels.Events, "LP Reconnect: {0}", url);
+            }
+            else
+            {
+                url = UrlBuilder.BuildPoll(connection, Name, connectionData);
+                connection.Trace(TraceLevels.Events, "LP Poll: {0}", url);
+            }
 
-            if (IsReconnecting(_connection))
+            return url;
+        }
+
+        private void OnMessage(IConnection connection, string message)
+        {
+            connection.Trace(TraceLevels.Messages, "LP: OnMessage({0})", message);
+
+            var shouldReconnect = ProcessResponse(connection, message, () => { });
+
+            if (IsReconnecting(connection))
             {
                 // If the timeout for the reconnect hasn't fired as yet just fire the 
                 // event here before any incoming messages are processed
-                TryReconnect(_connection);
+                TryReconnect(connection);
             }
 
             if (shouldReconnect)
             {
                 // Transition into reconnecting state
-                _connection.EnsureReconnecting();
+                connection.EnsureReconnecting();
             }
         }
 
@@ -260,34 +285,32 @@ namespace Microsoft.AspNet.SignalR.Client.Transports
             return TaskAsyncHelper.Empty;
         }
 
-        private void OnError(Exception exception)
+        // internal virtual for testing
+        internal virtual void OnError(IConnection connection, Exception exception)
         {
-            // will be no-op if handler already finished (either succeeded or failed)
-            _initializeHandler.Fail(exception);
-
             _reconnectInvoker.Invoke();
 
-            if (!TransportHelper.VerifyLastActive(_connection))
+            if (!TransportHelper.VerifyLastActive(connection))
             {
                 StopPolling();
             }
 
             // Transition into reconnecting state
-            _connection.EnsureReconnecting();
+            connection.EnsureReconnecting();
 
             // Sometimes a connection might have been closed by the server before we get to write anything
             // so just try again and raise OnError.
             if (!ExceptionHelper.IsRequestAborted(exception) && !(exception is IOException))
             {
-                _connection.OnError(exception);
+                connection.OnError(exception);
             }
         }
 
-        private bool OnChunk(ArraySegment<byte> readBuffer)
+        private static bool OnChunk(IConnection connection, ArraySegment<byte> readBuffer)
         {
             if (IsKeepAlive(readBuffer))
             {
-                _connection.MarkLastMessage();
+                connection.MarkLastMessage();
                 return false;
             }
 

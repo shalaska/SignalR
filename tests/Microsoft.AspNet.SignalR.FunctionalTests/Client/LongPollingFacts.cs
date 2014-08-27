@@ -1,172 +1,92 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNet.SignalR.Client.Http;
 using Microsoft.AspNet.SignalR.Client.Transports;
 using Moq;
+using Newtonsoft.Json;
 using Xunit;
 
 namespace Microsoft.AspNet.SignalR.Tests
 {
-    /*
     public class LongPollingFacts
     {
         [Fact]
         public void PollingRequestHandlerDoesNotPollAfterClose()
         {
-            var httpClient = new CustomHttpClient();
-            var requestHandler = new PollingRequestHandler(httpClient);
-            var active = true;
+            var disconnectCts = new CancellationTokenSource();
 
-            Action verifyActive = () =>
-            {
-                Assert.True(active);
-            };
+            var mockConnection = new Mock<Client.IConnection>();
+            mockConnection.SetupGet(c => c.JsonSerializer).Returns(JsonSerializer.CreateDefault());
+            mockConnection.Setup(c => c.TotalTransportConnectTimeout).Returns(TimeSpan.FromSeconds(5));
 
-            requestHandler.ResolveUrl = () =>
-            {
-                Assert.True(active);
+            var pollTaskCompletionSource = new TaskCompletionSource<IResponse>();
+            var pollingWh = new ManualResetEvent(false);
 
-                return "";
-            };
+            var mockHttpClient = CreateFakeHttpClient(pollingWh, pollTaskCompletionSource.Task);
+            var longPollingTransport = new LongPollingTransport(mockHttpClient.Object);
 
-            requestHandler.PrepareRequest += request =>
-            {
-                verifyActive();
-            };
+            Assert.True(
+                longPollingTransport.Start(mockConnection.Object, string.Empty, disconnectCts.Token)
+                    .Wait(TimeSpan.FromSeconds(15)));
 
-            requestHandler.OnPolling += verifyActive;
+            // wait for the first polling request
+            Assert.True(pollingWh.WaitOne(TimeSpan.FromSeconds(2)));
+            
+            // stop polling loop
+            disconnectCts.Cancel();
 
-            requestHandler.OnAfterPoll += exception =>
-            {
-                verifyActive();
-                return TaskAsyncHelper.Empty;
-            };
+            // finish polling request
+            pollTaskCompletionSource.SetResult(CreateResponse(string.Empty));
 
-            requestHandler.OnError += exception =>
-            {
-                verifyActive();
-            };
+            // give it some time to make sure a new poll was not setup after verification
+            Thread.Sleep(1000);
 
-            requestHandler.OnMessage += message =>
-            {
-                verifyActive();
-            };
-
-            requestHandler.OnAbort += request =>
-            {
-                active = false;
-            };
-
-            requestHandler.Start();
-
-            // Let the request handler run for three seconds
-            Thread.Sleep(TimeSpan.FromSeconds(.1));
-
-            requestHandler.Stop();
-
-            // Let all requests finish to see if we get any unintended results
-            Thread.Sleep(TimeSpan.FromSeconds(1));
+            mockHttpClient
+                .Verify(c => c.Post(It.Is<string>(url => url.StartsWith("poll?")), It.IsAny<Action<Client.Http.IRequest>>(),
+                    It.IsAny<IDictionary<string, string>>(), It.IsAny<bool>()), Times.Once());
         }
 
-        [Fact]
-        public void PollingRequestHandlerDoesNotPollAfterCloseMidRequest()
+        private static Mock<IHttpClient> CreateFakeHttpClient(ManualResetEvent pollingWh, Task<IResponse> pollingTask)
         {
-            var httpClient = new CustomHttpClient();
-            var requestHandler = new PollingRequestHandler(httpClient);
-            var active = true;
-            var killRequest = false;
-            Action verifyActive = () =>
-            {
-                Assert.True(active);
-            };
-
-            requestHandler.ResolveUrl = () =>
-            {
-                Assert.True(active);
-
-                return "";
-            };
-
-            requestHandler.PrepareRequest += request =>
-            {
-                if (killRequest)
-                {
-                    // Execute the stop on a different thread so it does not share the lock
-                    // This is to simulate a real world situation in which the user requests the connection to stop
-                    ThreadPool.QueueUserWorkItem(state =>
+            var mockHttpClient = new Mock<IHttpClient>();
+            mockHttpClient.Setup(m => m.Post(It.IsAny<string>(),
+                It.IsAny<Action<Client.Http.IRequest>>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<bool>()))
+                .Returns<string, Action<Client.Http.IRequest>, IDictionary<string, string>, bool>(
+                    (url, request, postData, isLongRunning) =>
                     {
-                        requestHandler.Stop();
+                        var responseMessage = string.Empty;
+                        if (url.Contains("connect?"))
+                        {
+                            responseMessage = "{\"C\":\"d-C6243495-A,0|B,0|C,1|D,0\",\"S\":1,\"M\":[]}";
+                        }
+                        else if (url.Contains("poll?"))
+                        {
+                            pollingWh.Set();
+                            return pollingTask;
+                        }
+
+                        return Task.FromResult(CreateResponse(responseMessage));
                     });
-                }
 
-                verifyActive();
-            };
+            mockHttpClient.Setup(
+                m => m.Get(It.IsAny<string>(), It.IsAny<Action<Client.Http.IRequest>>(), It.IsAny<bool>()))
+                .Returns<string, Action<Client.Http.IRequest>, bool>(
+                    (url, request, isLongRunning) => Task.FromResult(CreateResponse("{ \"Response\" : \"started\"}")));
 
-            requestHandler.OnPolling += verifyActive;
+            return mockHttpClient;
+        }
 
-            requestHandler.OnMessage += message =>
-            {
-                verifyActive();
-            };
+        private static IResponse CreateResponse(string contents)
+        {
+            var mockResponse = new Mock<IResponse>();
+            mockResponse.Setup(r => r.GetStream())
+                .Returns(new MemoryStream(Encoding.UTF8.GetBytes(contents)));
 
-            requestHandler.OnAfterPoll += exception =>
-            {
-                verifyActive();
-                return TaskAsyncHelper.Empty;
-            };
-
-            requestHandler.OnError += exception =>
-            {
-                verifyActive();
-            };
-
-            requestHandler.OnAbort += request =>
-            {
-                active = false;
-            };
-
-            requestHandler.Start();
-
-            // Let the request handler run for three seconds
-            Thread.Sleep(TimeSpan.FromSeconds(.1));
-
-            killRequest = true;
-
-            // Let all requests finish to see if we get any unintended results
-            Thread.Sleep(TimeSpan.FromSeconds(1));
+            return mockResponse.Object;
         }
     }
-
-    public class CustomHttpClient : IHttpClient
-    {
-        public void Initialize(SignalR.Client.IConnection connection)
-        {
-        }
-
-        public Task<IResponse> Get(string url, Action<Client.Http.IRequest> prepareRequest, bool isLongRunning)
-        {
-            throw new NotImplementedException();
-        }
-
-        public Task<IResponse> Post(string url, Action<Client.Http.IRequest> prepareRequest, IDictionary<string, string> postData, bool isLongRunning)
-        {
-            var response = new Mock<IResponse>();
-            var request = new Mock<Client.Http.IRequest>();
-            var mockStream = new MemoryStream();
-            var sw = new StreamWriter(mockStream);
-            sw.Write("{}");
-            sw.Flush();
-            mockStream.Position = 0;
-
-            response.Setup(r => r.GetStream()).Returns(mockStream);
-
-            prepareRequest(request.Object);
-
-            return TaskAsyncHelper.FromResult<IResponse>(response.Object);
-        }
-    }
-     */
 }

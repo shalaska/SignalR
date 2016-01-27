@@ -10,27 +10,13 @@
         events = $.signalR.events,
         changeState = $.signalR.changeState,
         isDisconnecting = $.signalR.isDisconnecting,
-        transportLogic = signalR.transports._logic,
-        browserSupportsXHRProgress = (function () {
-                try {
-                    return "onprogress" in new window.XMLHttpRequest();
-                } catch (e) {
-                    // No XHR means no XHR progress event
-                    return false;
-                }
-            })();
+        transportLogic = signalR.transports._logic;
 
     signalR.transports.longPolling = {
         name: "longPolling",
 
-        supportsKeepAlive: function (connection) {
-            return browserSupportsXHRProgress &&
-                   connection.ajaxDataType !== "jsonp" &&
-                   // Don't check for keep alives if there is a delay configured between poll requests.
-                   // Don't check for keep alives if the server didn't send back the "LongPollDelay" as
-                   // part of the response to /negotiate. That indicates the server is running an older
-                   // version of SignalR that doesn't send long polling keep alives.
-                   connection._.longPollDelay === 0;
+        supportsKeepAlive: function () {
+            return false;
         },
 
         reconnectDelay: 3000,
@@ -42,16 +28,11 @@
                 fireConnect = function () {
                     fireConnect = $.noop;
 
-                    // Reset onFailed to null because it shouldn't be called again
-                    onFailed = null;
-
                     connection.log("LongPolling connected.");
                     onSuccess();
                 },
-                tryFailConnect = function () {
-                    if (onFailed) {
-                        onFailed();
-                        onFailed = null;
+                tryFailConnect = function (error) {
+                    if (onFailed(error)) {
                         connection.log("LongPolling failed to connect.");
                         return true;
                     }
@@ -90,7 +71,16 @@
                         connect = (messageId === null),
                         reconnecting = !connect,
                         polling = !raiseReconnect,
-                        url = transportLogic.getUrl(instance, that.name, reconnecting, polling);
+                        url = transportLogic.getUrl(instance, that.name, reconnecting, polling, true /* use Post for longPolling */),
+                        postData = {};
+
+                    if (instance.messageId) {
+                        postData.messageId = instance.messageId;
+                    }
+
+                    if (instance.groupsToken) {
+                        postData.groupsToken = instance.groupsToken;
+                    }
 
                     // If we've disconnected during the time we've tried to re-instantiate the poll then stop.
                     if (isDisconnecting(instance) === true) {
@@ -105,6 +95,10 @@
                             }
                         },
                         url: url,
+                        type: "POST",
+                        contentType: signalR._.defaultContentType,
+                        data: postData,
+                        timeout: connection._.pollTimeout,
                         success: function (result) {
                             var minData,
                                 delay = 0,
@@ -142,10 +136,6 @@
                                 delay = data.LongPollDelay;
                             }
 
-                            if (data && data.Disconnect) {
-                                return;
-                            }
-
                             if (isDisconnecting(instance) === true) {
                                 return;
                             }
@@ -170,6 +160,8 @@
                         },
 
                         error: function (data, textStatus) {
+                            var error = signalR._.transportError(signalR.resources.longPollFailed, connection.transport, data, instance.pollXhr);
+
                             // Stop trying to trigger reconnect, connection is in an error state
                             // If we're not in the reconnect state this will noop
                             window.clearTimeout(privateData.reconnectTimeoutId);
@@ -180,7 +172,7 @@
                                 return;
                             }
 
-                            if (!tryFailConnect()) {
+                            if (!tryFailConnect(error)) {
 
                                 // Increment our reconnect errors, we assume all errors to be reconnect errors
                                 // In the case that it's our first error this will cause Reconnect to be fired
@@ -189,7 +181,7 @@
 
                                 if (connection.state !== signalR.connectionState.reconnecting) {
                                     connection.log("An error occurred using longPolling. Status = " + textStatus + ".  Response = " + data.responseText + ".");
-                                    $(instance).triggerHandler(events.onError, [signalR._.transportError(signalR.resources.longPollFailed, connection.transport, data, instance.pollXhr)]);
+                                    $(instance).triggerHandler(events.onError, [error]);
                                 }
 
                                 // We check the state here to verify that we're not in an invalid state prior to verifying Reconnect.

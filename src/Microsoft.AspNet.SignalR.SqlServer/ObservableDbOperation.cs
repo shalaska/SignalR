@@ -17,15 +17,15 @@ namespace Microsoft.AspNet.SignalR.SqlServer
     /// </summary>
     internal class ObservableDbOperation : DbOperation, IDisposable, IDbBehavior
     {
-        private readonly List<Tuple<int, int>> _updateLoopRetryDelays = new List<Tuple<int, int>> {
-            new Tuple<int, int>(0, 3),      // 0ms x 3
-            new Tuple<int, int>(10, 3),     // 10ms x 3
-            new Tuple<int, int>(50, 2),     // 50ms x 2
-            new Tuple<int, int>(100, 2),    // 100ms x 2
-            new Tuple<int, int>(200, 2),    // 200ms x 2
-            new Tuple<int, int>(1000, 2),  // 1000ms x 2
-            new Tuple<int, int>(1500, 2),  // 1500ms x 2
-            new Tuple<int, int>(3000, 1)   // 3000ms x 1
+        private readonly Tuple<int, int>[] _updateLoopRetryDelays = new [] {
+            Tuple.Create(0, 3),    // 0ms x 3
+            Tuple.Create(10, 3),   // 10ms x 3
+            Tuple.Create(50, 2),   // 50ms x 2
+            Tuple.Create(100, 2),  // 100ms x 2
+            Tuple.Create(200, 2),  // 200ms x 2
+            Tuple.Create(1000, 2), // 1000ms x 2
+            Tuple.Create(1500, 2), // 1500ms x 2
+            Tuple.Create(3000, 1)  // 3000ms x 1
         };
         private readonly object _stopLocker = new object();
         private readonly ManualResetEventSlim _stopHandle = new ManualResetEventSlim(true);
@@ -48,6 +48,15 @@ namespace Microsoft.AspNet.SignalR.SqlServer
             _dbBehavior = this;
 
             InitEvents();
+        }
+
+        /// <summary>
+        /// For use from tests only.
+        /// </summary>
+        internal long CurrentNotificationState
+        {
+            get { return _notificationState; }
+            set { _notificationState = value; }
         }
 
         private void InitEvents()
@@ -81,15 +90,19 @@ namespace Microsoft.AspNet.SignalR.SqlServer
 
             var useNotifications = _dbBehavior.StartSqlDependencyListener();
 
-            if (useNotifications)
-            {
-                _notificationState = NotificationState.ProcessingUpdates;
-            }
-
             var delays = _dbBehavior.UpdateLoopRetryDelays;
 
             for (var i = 0; i < delays.Count; i++)
             {
+                if (i == 0 && useNotifications)
+                {
+                    // Reset the state to ProcessingUpdates if this is the start of the loop.
+                    // This should be safe to do here without Interlocked because the state is protected
+                    // in the other two cases using Interlocked, i.e. there should only be one instance of
+                    // this running at any point in time.
+                    _notificationState = NotificationState.ProcessingUpdates;
+                }
+
                 Tuple<int, int> retry = delays[i];
                 var retryDelay = retry.Item1;
                 var retryCount = retry.Item2;
@@ -125,6 +138,8 @@ namespace Microsoft.AspNet.SignalR.SqlServer
 
                     if (recordCount > 0)
                     {
+                        Trace.TraceVerbose("{0}{1} records received", TracePrefix, recordCount);
+
                         // We got records so start the retry loop again
                         i = -1;
                         break;
@@ -156,15 +171,36 @@ namespace Microsoft.AspNet.SignalR.SqlServer
 
                                 Queried();
 
-                                if (recordCount > 0 ||
-                                    Interlocked.CompareExchange(ref _notificationState, NotificationState.AwaitingNotification,
-                                        NotificationState.ProcessingUpdates) == NotificationState.NotificationReceived)
+                                if (recordCount > 0)
                                 {
-                                    Trace.TraceVerbose("{0}Records received while setting up SQL notification, restarting the recieve loop", TracePrefix);
+                                    Trace.TraceVerbose("{0}Records were returned by the command that sets up the SQL notification, restarting the receive loop", TracePrefix);
 
                                     i = -1;
                                     break; // break the inner for loop
-                                };
+                                }
+                                else
+                                {
+                                    var previousState = Interlocked.CompareExchange(ref _notificationState, NotificationState.AwaitingNotification,
+                                        NotificationState.ProcessingUpdates);
+
+                                    if (previousState == NotificationState.AwaitingNotification)
+                                    {
+                                        Trace.TraceError("{0}A SQL notification was already running. Overlapping receive loops detected, this should never happen. BUG!", TracePrefix);
+
+                                        return;
+                                    }
+
+                                    if (previousState == NotificationState.NotificationReceived)
+                                    {
+                                        // Failed to change _notificationState from ProcessingUpdates to AwaitingNotification, it was already NotificationReceived
+
+                                        Trace.TraceVerbose("{0}The SQL notification fired before the receive loop returned, restarting the receive loop", TracePrefix);
+
+                                        i = -1;
+                                        break; // break the inner for loop
+                                    }
+                                    
+                                }
 
                                 Trace.TraceVerbose("{0}No records received while setting up SQL notification", TracePrefix);
 
@@ -243,19 +279,31 @@ namespace Microsoft.AspNet.SignalR.SqlServer
                 }
             }
 
-            if (Interlocked.CompareExchange(ref _notificationState,
-                NotificationState.NotificationReceived, NotificationState.ProcessingUpdates) == NotificationState.ProcessingUpdates)
+            var previousState = Interlocked.CompareExchange(ref _notificationState,
+                NotificationState.NotificationReceived, NotificationState.ProcessingUpdates);
+
+            if (previousState == NotificationState.NotificationReceived)
             {
+                Trace.TraceError("{0}Overlapping SQL change notifications received, this should never happen, BUG!", TracePrefix);
+                
+                return;
+            }
+            if (previousState == NotificationState.ProcessingUpdates)
+            {
+                // We're still in the original receive loop
+
                 // New updates will be retreived by the original reader thread
                 Trace.TraceVerbose("{0}Original reader processing is still in progress and will pick up the changes", TracePrefix);
 
                 return;
             }
 
+            // _notificationState wasn't ProcessingUpdates (likely AwaitingNotification)
+
             // Check notification args for issues
             if (e.Type == SqlNotificationType.Change)
             {
-                if (e.Info == SqlNotificationInfo.Insert)
+                if (e.Info == SqlNotificationInfo.Update)
                 {
                     Trace.TraceVerbose("{0}SQL notification details: Type={1}, Source={2}, Info={3}", TracePrefix, e.Type, e.Source, e.Info);
                 }
@@ -352,9 +400,14 @@ namespace Microsoft.AspNet.SignalR.SqlServer
             {
                 try
                 {
+                    Trace.TraceVerbose("{0}Stopping SQL notification listener", TracePrefix);
                     SqlDependency.Stop(ConnectionString);
+                    Trace.TraceVerbose("{0}SQL notification listener stopped", TracePrefix);
                 }
-                catch (Exception) { }
+                catch (Exception stopEx)
+                {
+                    Trace.TraceError("{0}Error occured while stopping SQL notification listener: {1}", TracePrefix, stopEx);
+                }
             }
 
             lock (_stopLocker)
@@ -366,7 +419,7 @@ namespace Microsoft.AspNet.SignalR.SqlServer
             }
         }
 
-        private static class NotificationState
+        internal static class NotificationState
         {
             public const long Enabled = 0;
             public const long ProcessingUpdates = 1;
